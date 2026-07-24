@@ -436,7 +436,11 @@ class SampleGenerator:
             chunk_center_x = np.round((valid_inner_square_extension[i][0] + valid_inner_square_extension[i][1]) / 2, 6)
             chunk_center_y = np.round((valid_inner_square_extension[i][2] + valid_inner_square_extension[i][3]) / 2, 6)
             center = np.concatenate([np.array([chunk_center_x, chunk_center_y, 0, 0]), np.zeros(self.feats.shape[1])]).reshape(1, -1)
-            valid_chunks[i] = (torch.from_numpy(valid_chunks[i]).cuda() - torch.from_numpy(center).cuda()).cpu().numpy()
+            # Perform centering on CPU in numpy. The original implementation moved each chunk
+            # to the GPU and back for a simple subtraction, which triggered a native access
+            # violation (0xC0000005) on some Windows/CUDA/GPU combinations. Use an in-place
+            # subtraction to avoid allocating a large temporary copy (reduces peak RAM).
+            valid_chunks[i] -= center
 
 
         logger.info('save chunks')

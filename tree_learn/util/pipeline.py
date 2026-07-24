@@ -111,23 +111,45 @@ def get_pointwise_preds(model, dataloader, config, logger=None):
 
 # ensemble pointwise predictions of overlapping tiles to get a single offset and semantic prediction for each point
 def ensemble(coords, semantic_scores, semantic_labels, offset_predictions, offset_labels, instance_labels, feats, input_feats):
-    feats_col_names = [f'feats{i}' for i in range(feats.shape[1])]
-    feats = pd.DataFrame(feats, columns=feats_col_names)
-    
-    input_feats_col_names = [f'input_feats{i}' for i in range(input_feats.shape[1])]
-    input_feats = pd.DataFrame(input_feats, columns=input_feats_col_names)
+    n_feats = feats.shape[1]
+    n_input_feats = input_feats.shape[1]
+    feats_col_names = [f'feats{i}' for i in range(n_feats)]
+    input_feats_col_names = [f'input_feats{i}' for i in range(n_input_feats)]
 
-    coords = pd.DataFrame(coords, columns=['x', 'y', 'z'])
-    semantic_scores = pd.DataFrame(semantic_scores, columns=['sem_scores1', 'sem_scores2'])
-    semantic_labels = pd.DataFrame(semantic_labels.reshape(-1, 1), columns=['semantic_labels'])
-    offset_predictions = pd.DataFrame(offset_predictions, columns=['offset_pred1', 'offset_pred2', 'offset_pred3'])
-    offset_labels = pd.DataFrame(offset_labels, columns=['offset_lab1', 'offset_lab2', 'offset_lab3'])
-    instance_labels = pd.DataFrame(instance_labels.reshape(-1, 1), columns=['instance_labels'])
+    # Build a single combined float32 array instead of constructing many DataFrames and
+    # concatenating them (which creates a full extra copy of all data and can exhaust RAM
+    # on large point clouds). Column order:
+    # [x, y, z, sem_scores1, sem_scores2, semantic_labels, offset_pred1..3,
+    #  offset_lab1..3, instance_labels, feats..., input_feats...]
+    n_points = coords.shape[0]
+    n_cols = 3 + 2 + 1 + 3 + 3 + 1 + n_feats + n_input_feats
+    combined = np.empty((n_points, n_cols), dtype=np.float32)
+    combined[:, 0:3] = coords
+    combined[:, 3:5] = semantic_scores
+    combined[:, 5] = semantic_labels.reshape(-1)
+    combined[:, 6:9] = offset_predictions
+    combined[:, 9:12] = offset_labels
+    combined[:, 12] = instance_labels.reshape(-1)
+    combined[:, 13:13 + n_feats] = feats
+    combined[:, 13 + n_feats:] = input_feats
 
-    df = pd.concat([coords, semantic_scores, semantic_labels, offset_predictions, offset_labels, instance_labels, feats, input_feats], axis=1)
+    # free the large inputs as soon as they are copied to reduce peak memory
+    del coords, semantic_scores, semantic_labels, offset_predictions, offset_labels, instance_labels, feats, input_feats
 
-    df = df.round({'x': 2, 'y': 2, 'z': 2})
+    col_names = (['x', 'y', 'z', 'sem_scores1', 'sem_scores2', 'semantic_labels',
+                  'offset_pred1', 'offset_pred2', 'offset_pred3',
+                  'offset_lab1', 'offset_lab2', 'offset_lab3', 'instance_labels']
+                 + feats_col_names + input_feats_col_names)
+    df = pd.DataFrame(combined, columns=col_names, copy=False)
+    del combined
+
+    # round coordinates in place (avoids a full copy of the coordinate columns)
+    df['x'] = df['x'].round(2)
+    df['y'] = df['y'].round(2)
+    df['z'] = df['z'].round(2)
+
     grouped = df.groupby(['x', 'y', 'z']).mean().reset_index()
+    del df
 
     # Convert columns to desired data types
     coords = grouped[['x', 'y', 'z']].to_numpy().astype('float32')
