@@ -9,10 +9,13 @@ import tqdm
 import torch
 import random
 import laspy
+import shapely
 from shapely.geometry import Point, Polygon
 from sklearn.neighbors import NearestNeighbors, KNeighborsClassifier
-from scipy import stats
-from sklearn.cluster import DBSCAN, HDBSCAN
+from scipy.spatial import cKDTree
+from concurrent.futures import ThreadPoolExecutor
+from sklearn.cluster import DBSCAN
+import hdbscan
 from tree_learn.util.data_preparation import voxelize, compute_features, load_data, SampleGenerator
 
 
@@ -76,18 +79,20 @@ def generate_tiles(cfg, forest_path, logger, return_type='voxelized'):
 
 
 # get offset and semantic predictions for all tiles
-def get_pointwise_preds(model, dataloader, config, logger=None):
+def get_pointwise_preds(model, dataloader, config, logger=None, save_backbone_feats=False):
     with torch.no_grad():
         model.eval()
-        semantic_prediction_logits, offset_predictions, semantic_labels, offset_labels, coords, instance_labels, backbone_feats, input_feats = [], [], [], [], [], [], [], []
+        semantic_prediction_logits, offset_predictions, semantic_labels, offset_labels, coords, instance_labels, input_feats = [], [], [], [], [], [], []
+        backbone_feats = [] if save_backbone_feats else None
         for batch in tqdm.tqdm(dataloader):
             # get voxel_sizes to use in forward
             batch['voxel_size'] = config.voxel_size
             # forward
             try:
                 output = model(batch, return_loss=False)
-                offset_prediction, semantic_prediction_logit, backbone_feat = output['offset_predictions'], output['semantic_prediction_logits'], output['backbone_feats']
-                offset_prediction, semantic_prediction_logit, backbone_feat = offset_prediction.cpu(), semantic_prediction_logit.cpu(), backbone_feat.cpu()
+                offset_prediction, semantic_prediction_logit = output['offset_predictions'].cpu(), output['semantic_prediction_logits'].cpu()
+                if save_backbone_feats:
+                    backbone_feat = output['backbone_feats'].cpu()
             except Exception as e:
                 if "reach zero!!!" in str(e):
                     if logger:
@@ -97,23 +102,33 @@ def get_pointwise_preds(model, dataloader, config, logger=None):
                     raise
 
             batch['coords'] = batch['coords'] + batch['centers']
-            input_feats.append(batch['input_feats'][batch['masks_inner']])
-            semantic_prediction_logits.append(semantic_prediction_logit[batch['masks_inner']]), semantic_labels.append(batch['semantic_labels'][batch['masks_inner']])
-            offset_predictions.append(offset_prediction[batch['masks_inner']]), offset_labels.append(batch['offset_labels'][batch['masks_inner']])
-            coords.append(batch['coords'][batch['masks_inner']]), instance_labels.append(batch['instance_labels'][batch['masks_inner']]), backbone_feats.append(backbone_feat[batch['masks_inner']])
+            mask_inner = batch['masks_inner']
+            input_feats.append(batch['input_feats'][mask_inner])
+            semantic_prediction_logits.append(semantic_prediction_logit[mask_inner])
+            semantic_labels.append(batch['semantic_labels'][mask_inner])
+            offset_predictions.append(offset_prediction[mask_inner])
+            offset_labels.append(batch['offset_labels'][mask_inner])
+            coords.append(batch['coords'][mask_inner])
+            instance_labels.append(batch['instance_labels'][mask_inner])
+            if save_backbone_feats:
+                backbone_feats.append(backbone_feat[mask_inner])
 
     input_feats = torch.cat(input_feats, 0).numpy()
     semantic_prediction_logits, semantic_labels = torch.cat(semantic_prediction_logits, 0).numpy(), torch.cat(semantic_labels, 0).numpy()
     offset_predictions, offset_labels = torch.cat(offset_predictions, 0).numpy(), torch.cat(offset_labels, 0).numpy()
-    coords, instance_labels, backbone_feats = torch.cat(coords, 0).numpy(), torch.cat(instance_labels).numpy(), torch.cat(backbone_feats, 0).numpy()
+    coords, instance_labels = torch.cat(coords, 0).numpy(), torch.cat(instance_labels).numpy()
+    if save_backbone_feats and backbone_feats is not None:
+        backbone_feats = torch.cat(backbone_feats, 0).numpy()
+    else:
+        backbone_feats = None
     return semantic_prediction_logits, semantic_labels, offset_predictions, offset_labels, coords, instance_labels, backbone_feats, input_feats
 
 
 # ensemble pointwise predictions of overlapping tiles to get a single offset and semantic prediction for each point
 def ensemble(coords, semantic_scores, semantic_labels, offset_predictions, offset_labels, instance_labels, feats, input_feats):
-    n_feats = feats.shape[1]
+    n_feats = feats.shape[1] if feats is not None else 0
     n_input_feats = input_feats.shape[1]
-    feats_col_names = [f'feats{i}' for i in range(n_feats)]
+    feats_col_names = [f'feats{i}' for i in range(n_feats)] if feats is not None else []
     input_feats_col_names = [f'input_feats{i}' for i in range(n_input_feats)]
 
     # Build a single combined float32 array instead of constructing many DataFrames and
@@ -130,8 +145,11 @@ def ensemble(coords, semantic_scores, semantic_labels, offset_predictions, offse
     combined[:, 6:9] = offset_predictions
     combined[:, 9:12] = offset_labels
     combined[:, 12] = instance_labels.reshape(-1)
-    combined[:, 13:13 + n_feats] = feats
-    combined[:, 13 + n_feats:] = input_feats
+    if feats is not None:
+        combined[:, 13:13 + n_feats] = feats
+        combined[:, 13 + n_feats:] = input_feats
+    else:
+        combined[:, 13:] = input_feats
 
     # free the large inputs as soon as they are copied to reduce peak memory
     del coords, semantic_scores, semantic_labels, offset_predictions, offset_labels, instance_labels, feats, input_feats
@@ -158,7 +176,7 @@ def ensemble(coords, semantic_scores, semantic_labels, offset_predictions, offse
     offset_predictions = grouped[['offset_pred1', 'offset_pred2', 'offset_pred3']].to_numpy().astype('float32')
     offset_labels = grouped[['offset_lab1', 'offset_lab2', 'offset_lab3']].to_numpy().astype('float32')
     instance_labels = grouped[['instance_labels']].to_numpy().astype('int64').flatten()
-    feats = grouped[feats_col_names].to_numpy().astype('float32')
+    feats = grouped[feats_col_names].to_numpy().astype('float32') if n_feats > 0 else None
     input_feats = grouped[input_feats_col_names].to_numpy().astype('float32')
     return coords, semantic_scores, semantic_labels, offset_predictions, offset_labels, instance_labels, feats, input_feats
 
@@ -204,7 +222,7 @@ def group_dbscan(cluster_coords, radius, npoint_thr, not_assigned_label_in_group
 
 # HDBSCAN
 def group_hdbscan(cluster_coords, npoint_thr, not_assigned_label_in_grouping, start_num_preds):
-    clustering = HDBSCAN(min_cluster_size=npoint_thr, n_jobs=N_JOBS).fit(cluster_coords)
+    clustering = hdbscan.HDBSCAN(min_cluster_size=npoint_thr, core_dist_n_jobs=4).fit(cluster_coords)
     cluster_nums, n_points = np.unique(clustering.labels_, return_counts=True)
     valid_cluster_nums = cluster_nums[(n_points >= npoint_thr) & (cluster_nums != -1)]
     ind_valid = np.isin(clustering.labels_, valid_cluster_nums)
@@ -231,17 +249,18 @@ def make_labels_consecutive(labels, start_num):
 # get all coordinates that are within a specified shape (e.g. an xy hull around a hull buffer). 
 # This way, trees at the edge can be identified or a buffer can be removed at the edge of the plot
 def get_coords_within_shape(coords, shape):
-    coords_df = pd.DataFrame(coords, columns=["x", "y", "z"])
-    coords_df["xy"] = list(zip(coords_df["x"], coords_df["y"]))
-    coords_df["xy"] = coords_df["xy"].apply(Point)
-    coords_geodf = geopandas.GeoDataFrame(coords_df, geometry='xy')
+    if hasattr(shape, "geometry"):
+        geom = shape.geometry.union_all() if hasattr(shape.geometry, "union_all") else shape.geometry.unary_union
+    elif hasattr(shape, "union_all"):
+        geom = shape.union_all()
+    elif hasattr(shape, "unary_union"):
+        geom = shape.unary_union
+    else:
+        geom = shape
 
-    joined = coords_geodf.sjoin(shape, how="left", predicate="within")
-    ind_within = np.array(joined["index_right"])
-    ind_within[ind_within == 0] = 1
-    ind_within[np.isnan(ind_within)] = 0
-    ind_within = ind_within.astype("bool")
-    return ind_within
+    x = coords[:, 0].astype(np.float64)
+    y = coords[:, 1].astype(np.float64)
+    return shapely.contains_xy(geom, x, y)
 
 
 # get a coarser grid of all xy points to calculate the hull
@@ -306,50 +325,50 @@ def get_cluster_means(coords, labels):
 
 
 # assign remaining tree points after initial clustering
-def assign_remaining_points_nearest_neighbor(coords, predictions, remaining_points_idx, n_neighbors=5):
+def assign_remaining_points_nearest_neighbor(coords, predictions, remaining_points_idx, n_neighbors=5, chunk_size=1000000):
     predictions = np.copy(predictions)
     assert len(coords) == len(predictions) # input variable should be of same size
     query_idx = np.argwhere(predictions == remaining_points_idx).reshape(-1)
     reference_idx = np.argwhere(predictions != remaining_points_idx).reshape(-1)
-    knn = KNeighborsClassifier(n_neighbors=n_neighbors, n_jobs=N_JOBS)
-    knn.fit(coords[reference_idx].copy(), predictions[reference_idx].copy())
-    neighbors_predictions = knn.predict(coords[query_idx].copy())
-    predictions[query_idx] = neighbors_predictions
+
+    if len(query_idx) == 0 or len(reference_idx) == 0:
+        return predictions.astype(np.int64)
+
+    ref_coords = coords[reference_idx]
+    ref_labels = predictions[reference_idx]
+    query_coords = coords[query_idx]
+
+    tree = cKDTree(ref_coords)
+    query_preds = np.empty(len(query_coords), dtype=np.int64)
+
+    for i in range(0, len(query_coords), chunk_size):
+        chunk = query_coords[i:i + chunk_size]
+        _, indices = tree.query(chunk, k=n_neighbors, workers=-1)
+        chunk_labels = torch.from_numpy(ref_labels[indices])
+        modes = torch.mode(chunk_labels, dim=1).values.numpy()
+        query_preds[i:i + len(chunk)] = modes
+
+    predictions[query_idx] = query_preds
     return predictions.astype(np.int64)
 
 
 # propagate predictions from source to target coordinates (e.g. lower resolution to higher resolution; does not have an effect on the actual predictions)
-def propagate_preds(source_coords, source_preds, target_coords, n_neighbors, n_jobs=1):
+def propagate_preds(source_coords, source_preds, target_coords, n_neighbors=5, n_jobs=-1, chunk_size=1000000):
     source_coords = source_coords.astype(np.float32)
     target_coords = target_coords.astype(np.float32)
     source_preds = source_preds.astype(np.int64)
 
-    # fit nearest neighbors and get k nearest labels for each point in target_coords
-    nbrs = NearestNeighbors(n_neighbors=n_neighbors, algorithm='auto', n_jobs=n_jobs)
-    nbrs.fit(source_coords)
-    neighbours_indices = nbrs.kneighbors(target_coords, n_neighbors, return_distance=False)
-    neighbours_preds = source_preds[neighbours_indices]
-
-    # get most common label among neighbours to obtain target_preds
-    N = neighbours_preds.shape[0]
+    tree = cKDTree(source_coords)
+    N = target_coords.shape[0]
     target_preds = np.empty(N, dtype=np.int64)
-    for i in range(N):
-        row = neighbours_preds[i]
-        # Ensure integer type (should already be int64)
-        row = row.astype(np.int64, copy=False)
-        
-        # Handle negative values by shifting
-        min_label = row.min()
-        if min_label < 0:
-            offset = -min_label
-            row_offset = row + offset
-            counts = np.bincount(row_offset)
-            mode_label = counts.argmax() - offset
-        else:
-            counts = np.bincount(row)
-            mode_label = counts.argmax()
 
-        target_preds[i] = mode_label
+    for i in range(0, N, chunk_size):
+        chunk = target_coords[i:i + chunk_size]
+        _, indices = tree.query(chunk, k=n_neighbors, workers=-1)
+        chunk_preds = torch.from_numpy(source_preds[indices])
+        modes = torch.mode(chunk_preds, dim=1).values.numpy()
+        target_preds[i:i + len(chunk)] = modes
+
     return target_preds
 
 
@@ -363,8 +382,8 @@ def save_data(data, save_format, save_name, save_folder, use_offset=True):
         # get points and labels
         assert data.shape[1] == 4
         points = data[:, :3]
-        labels = data[:, 3]
-        classification = np.ones_like(labels)
+        labels = data[:, 3].astype(np.int32)
+        classification = np.ones_like(labels, dtype=np.uint8)
         classification[labels == 0] = 2 # terrain according to For-Instance labeling convention (https://zenodo.org/records/8287792)
         classification[labels != 0] = 4 # stem according to For-Instance labeling convention (https://zenodo.org/records/8287792)
 
@@ -384,7 +403,7 @@ def save_data(data, save_format, save_name, save_folder, use_offset=True):
         las.y = points[:, 1]
         las.z = points[:, 2]
 
-        las.add_extra_dim(laspy.ExtraBytesParams(name="treeID", type=np.uint32))
+        las.add_extra_dim(laspy.ExtraBytesParams(name="treeID", type=np.int32))
         las.treeID = labels
         las.classification = classification
 
@@ -425,13 +444,15 @@ def save_treewise(coords, instance_preds, cluster_means_within_hull, insts_not_a
     os.makedirs(trunk_base_inside_dir, exist_ok=True)
     os.makedirs(trunk_base_outside_dir, exist_ok=True)
 
-    for i in np.unique(instance_preds):
+    unique_instances = np.unique(instance_preds)
+
+    def _save_tree(i):
         pred_coord = coords[instance_preds == i]
         pred_coord = np.hstack([pred_coord, i * np.ones(len(pred_coord))[:, None]])
         if i == non_trees_label_in_grouping:
             # use offset=false here for easy visualization of all individual trees in cloudcompare
             save_data(pred_coord, save_format, 'non_trees', plot_results_dir, use_offset=False)
-            continue
+            return
 
         if cluster_means_within_hull[i-1] and insts_not_at_edge[i-1]:
             save_data(pred_coord, save_format, str(int(i)), completely_inside_dir, use_offset=False)
@@ -439,6 +460,10 @@ def save_treewise(coords, instance_preds, cluster_means_within_hull, insts_not_a
             save_data(pred_coord, save_format, str(int(i)), trunk_base_inside_dir, use_offset=False)
         elif not cluster_means_within_hull[i-1]:
             save_data(pred_coord, save_format, str(int(i)), trunk_base_outside_dir, use_offset=False)
+
+    max_workers = min(8, os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        list(executor.map(_save_tree, unique_instances))
 
 
 # get hash values of voxelized points
@@ -467,8 +492,10 @@ def propagate_preds_hash_full(coords, instance_preds, coords_to_return, hash_map
     target_preds = np.empty(coords_to_return.shape[0], np.int64)
     not_yet_propagated = np.ones(coords_to_return.shape[0], bool) # in case that tile denoising took place, this is needed to propagate the remaining points. By default, denoising is not used anymore
     for i, hash_value in enumerate(hash_values):
-        target_preds[np.array(hash_mapping[hash_value], np.int64)] = instance_preds[i]
-        not_yet_propagated[np.array(hash_mapping[hash_value], np.int64)] = False
+        orig_indices = hash_mapping.get(hash_value)
+        if orig_indices is not None:
+            target_preds[orig_indices] = instance_preds[i]
+            not_yet_propagated[orig_indices] = False
 
     return target_preds, not_yet_propagated
 

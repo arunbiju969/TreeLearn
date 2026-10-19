@@ -1,8 +1,30 @@
 # PARTIALLY TAKEN FROM https://github.com/pdebench/PDEBench (MIT LICENSE)
 
 import argparse
-from torchvision.datasets.utils import download_url
-import os	
+import os
+import requests
+from tqdm import tqdm
+
+def download_url(url, root_folder, filename):
+    filepath = os.path.join(root_folder, filename)
+    if os.path.exists(filepath):
+        print(f"File {filename} already exists at {filepath}, skipping download.")
+        return
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, stream=True, headers=headers)
+    response.raise_for_status()
+    total_size = int(response.headers.get("content-length", 0))
+    with open(filepath, "wb") as f, tqdm(
+        desc=filename,
+        total=total_size,
+        unit="iB",
+        unit_scale=True,
+        unit_divisor=1024,
+    ) as bar:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+                bar.update(len(chunk))
 
 BASE_PATH = "https://data.goettingen-research-online.de/api/access/datafile/:persistentId?persistentId=doi:10.25625/VPMPID/"
 

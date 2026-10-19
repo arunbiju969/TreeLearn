@@ -396,9 +396,10 @@ class SampleGenerator:
         y_points = points[:, 1]
 
 
-        logger.info('subset all points with outer square extensions')
-        chunks = []
-        for xmin_outer, xmax_outer, ymin_outer, ymax_outer in outer_square_extension:
+        logger.info('processing and saving chunks')
+        chunk_counter = 0
+        outer_square_extension_cpu = outer_square_extension.cpu().numpy()
+        for i, (xmin_outer, xmax_outer, ymin_outer, ymax_outer) in enumerate(tqdm(outer_square_extension_cpu)):
 
             ind_xmin_outer = x_points >= xmin_outer
             ind_xmax_outer = x_points <= xmax_outer
@@ -406,16 +407,13 @@ class SampleGenerator:
             ind_ymax_outer = y_points <= ymax_outer
 
             ind_outer = ind_xmin_outer & ind_xmax_outer & ind_ymin_outer & ind_ymax_outer
+            if not ind_outer.any():
+                continue
+
             chunk = points[ind_outer].cpu().numpy()
-            chunks.append(chunk)
 
-
-        logger.info('only select chunks whose inner squares contain points')
-        valid_chunks = []
-        valid_inner_square_extension = []
-        for i in range(len(chunks)):
-            x_chunk = chunks[i][:, 0]
-            y_chunk = chunks[i][:, 1]
+            x_chunk = chunk[:, 0]
+            y_chunk = chunk[:, 1]
 
             ind_xmin_inner = x_chunk >= inner_square_extension[i][0]
             ind_xmax_inner = x_chunk < inner_square_extension[i][1]
@@ -424,40 +422,24 @@ class SampleGenerator:
 
             temp_ind_inner = ind_xmin_inner & ind_xmax_inner & ind_ymin_inner & ind_ymax_inner
             
-            if len(chunks[i][temp_ind_inner]) > 0:
-                valid_chunks.append(chunks[i])
-                valid_inner_square_extension.append(inner_square_extension[i])
-        del chunks # free memory
-        valid_inner_square_extension = np.array(valid_inner_square_extension).astype(np.float32)
+            if not temp_ind_inner.any():
+                continue
 
-
-        logger.info('center chunks')
-        for i in range(len(valid_chunks)):
-            chunk_center_x = np.round((valid_inner_square_extension[i][0] + valid_inner_square_extension[i][1]) / 2, 6)
-            chunk_center_y = np.round((valid_inner_square_extension[i][2] + valid_inner_square_extension[i][3]) / 2, 6)
+            chunk_center_x = np.round((inner_square_extension[i][0] + inner_square_extension[i][1]) / 2, 6)
+            chunk_center_y = np.round((inner_square_extension[i][2] + inner_square_extension[i][3]) / 2, 6)
             center = np.concatenate([np.array([chunk_center_x, chunk_center_y, 0, 0]), np.zeros(self.feats.shape[1])]).reshape(1, -1)
-            # Perform centering on CPU in numpy. The original implementation moved each chunk
-            # to the GPU and back for a simple subtraction, which triggered a native access
-            # violation (0xC0000005) on some Windows/CUDA/GPU combinations. Use an in-place
-            # subtraction to avoid allocating a large temporary copy (reduces peak RAM).
-            valid_chunks[i] -= center
-
-
-        logger.info('save chunks')
-        for i, valid_chunk in tqdm(enumerate(valid_chunks)):
+            chunk -= center
 
             # denoise
             if self.n_neigh_sor is not None and self.multiplier_sor is not None:
-                sor_filter_idx = sor_filter(valid_chunk, n_neigh_sor=self.n_neigh_sor, multiplier_sor=self.multiplier_sor)
-                valid_chunk = valid_chunk[sor_filter_idx]
-                valid_chunks[i] = None # free memory
+                sor_filter_idx = sor_filter(chunk, n_neigh_sor=self.n_neigh_sor, multiplier_sor=self.multiplier_sor)
+                chunk = chunk[sor_filter_idx]
 
             if self.rad is not None and self.npoints_rad is not None:
-                rad_filter_idx = rad_filter(valid_chunk, rad=self.rad, npoints_rad=self.npoints_rad)
-                valid_chunk = valid_chunk[rad_filter_idx]
-                valid_chunks[i] = None # free memory
+                rad_filter_idx = rad_filter(chunk, rad=self.rad, npoints_rad=self.npoints_rad)
+                chunk = chunk[rad_filter_idx]
 
-            valid_chunk = valid_chunk.astype(np.float32)
+            chunk = chunk.astype(np.float32)
 
             # meta data
             meta_data = dict()
@@ -470,23 +452,21 @@ class SampleGenerator:
             meta_data['outer_edge'] = outer_edge
 
             # data
-            points = valid_chunk[:, :3]
-            instance_label = valid_chunk[:, 3]
-            feat = valid_chunk[:, 4:]
-            chunk_center_x = np.round((valid_inner_square_extension[i][0] + valid_inner_square_extension[i][1]) / 2, 6)
-            chunk_center_y = np.round((valid_inner_square_extension[i][2] + valid_inner_square_extension[i][3]) / 2, 6)
-            center = np.array([chunk_center_x, chunk_center_y, 0])
+            points_save = chunk[:, :3]
+            instance_label_save = chunk[:, 3]
+            feat_save = chunk[:, 4:]
+            center_3d = np.array([chunk_center_x, chunk_center_y, 0])
 
             data = dict()
-            data['points'] = points
-            data['feat'] = feat
-            data['instance_label'] = instance_label.astype(np.int32)
-            data['center'] = center
+            data['points'] = points_save
+            data['feat'] = feat_save
+            data['instance_label'] = instance_label_save.astype(np.int32)
+            data['center'] = center_3d
             
             # saving
-            save_name_data = self.plot_name + '_' + str(i) + '.npz'
+            save_name_data = self.plot_name + '_' + str(chunk_counter) + '.npz'
             save_path_data = os.path.join(self.save_dir_data, save_name_data)
-            save_name_meta_data = self.plot_name + '_' + str(i) + '.json'
+            save_name_meta_data = self.plot_name + '_' + str(chunk_counter) + '.json'
             save_path_meta_data = os.path.join(self.save_dir_meta_data, save_name_meta_data)
 
             if compressed:
@@ -495,6 +475,12 @@ class SampleGenerator:
                 np.savez(save_path_data, **data)
             with open(save_path_meta_data, 'w') as json_file:
                 json.dump(meta_data, json_file)
+
+            chunk_counter += 1
+
+        del points
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return
 
 

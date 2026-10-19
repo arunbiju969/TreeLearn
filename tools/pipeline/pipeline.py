@@ -67,7 +67,8 @@ def run_treelearn_pipeline(config, config_path=None):
     dataset = TreeDataset(**config.dataset_test, logger=logger)
     dataloader = build_dataloader(dataset, training=False, **config.dataloader)
     load_checkpoint(config.pretrain, logger, model)
-    pointwise_results = get_pointwise_preds(model, dataloader, config.model, logger)
+    save_backbone_feats = getattr(config.save_cfg, 'save_backbone_feats', False)
+    pointwise_results = get_pointwise_preds(model, dataloader, config.model, logger, save_backbone_feats=save_backbone_feats)
     semantic_prediction_logits, semantic_labels, offset_predictions, offset_labels, coords, instance_labels, backbone_feats, input_feats = pointwise_results
     del model
 
@@ -104,11 +105,12 @@ def run_treelearn_pipeline(config, config_path=None):
             'semantic_prediction_logits': semantic_prediction_logits,
             'semantic_labels': semantic_labels,
             'instance_labels': instance_labels,
-            'backbone_feats': backbone_feats,
             'input_feats': input_feats,
             'instance_preds': instance_preds,
             'instance_preds_after_initial_clustering': instance_preds_after_initial_clustering
         }
+        if backbone_feats is not None:
+            pointwise_results['backbone_feats'] = backbone_feats
         if config.shape_cfg.outer_remove:
             pointwise_results['masks_inner_coords'] = masks_inner_coords
             hull_buffer_large.to_pickle(os.path.join(pointwise_dir, 'hull_buffer_large.pkl'))

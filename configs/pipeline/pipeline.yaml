@@ -26,5 +26,6 @@ save_cfg:
   save_formats: ['laz'] # save formats for predicted forest (laz, las, npz, npy or txt)
   save_treewise: True # additionally save predicted trees individually as las files
   save_pointwise: True # additionally save pointwise results as numpy arrays (offset predictions, semantic predictions, etc.)
+  save_backbone_feats: False # omit intermediate 32-dim backbone features to save ~10 GB RAM during inference & ensembling
   return_type: 'original' # returns predictions on either the "voxelized_and_filtered", "voxelized" or "original" point cloud. Takes a bit longer if "original" is selected since predictions must be propagated to original input points.
   results_dir: 'results' # name of directory where results are saved
