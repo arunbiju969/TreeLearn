@@ -38,16 +38,20 @@ def run_treelearn_pipeline(config, config_path=None):
     
     # quick and dirty fix for the fact that method throws errors/does not work with high-magnitude coords
     # --> center coords and de-center at the end
-    data = load_data(config.forest_path)
-    xyz = data[:, :3].astype(np.float64)
-    xyz_mean = np.mean(xyz, 0).astype(np.float64)
-    xyz_centered = xyz - xyz_mean
-    # avoids overwriting of original file
-    if not config.forest_path.endswith('.npz'):
-        config.forest_path = config.forest_path[:-4] + '.npz'
+    target_npz = config.forest_path[:-4] + '.npz' if not config.forest_path.endswith('.npz') else config.forest_path[:-4] + '.npy'
+    mean_path = config.forest_path[:-4] + '_mean.npy'
+    if os.path.exists(target_npz) and os.path.exists(mean_path):
+        xyz_mean = np.load(mean_path)
+        config.forest_path = target_npz
     else:
-        config.forest_path = config.forest_path[:-4] + '.npy'
-    np.savez_compressed(config.forest_path, points=xyz_centered)
+        data = load_data(config.forest_path)
+        xyz = data[:, :3].astype(np.float64)
+        xyz_mean = np.mean(xyz, 0).astype(np.float64)
+        xyz_centered = xyz - xyz_mean
+        config.forest_path = target_npz
+        np.savez(config.forest_path, points=xyz_centered)
+        np.save(mean_path, xyz_mean)
+        del data, xyz, xyz_centered
     
     # documentation
     logger = get_root_logger(os.path.join(documentation_dir, 'log_pipeline.txt'))
@@ -114,7 +118,7 @@ def run_treelearn_pipeline(config, config_path=None):
         if config.shape_cfg.outer_remove:
             pointwise_results['masks_inner_coords'] = masks_inner_coords
             hull_buffer_large.to_pickle(os.path.join(pointwise_dir, 'hull_buffer_large.pkl'))
-        np.savez_compressed(os.path.join(pointwise_dir, 'pointwise_results.npz'), **pointwise_results)
+        np.savez(os.path.join(pointwise_dir, 'pointwise_results.npz'), **pointwise_results)
         
         # offset-shifted coordinates filtered by verticality and offset (initial clustering results); save as laz file for visualization
         verticality = input_feats[:, -1]

@@ -1,0 +1,29 @@
+# default_args is used to include configs from the _modular folder into this config.
+default_args: ["configs/_modular/sample_generation.yaml", "configs/_modular/model.yaml", "configs/_modular/grouping.yaml", "configs/_modular/dataset_test.yaml"]
+
+############ modification of default args
+model:
+  spatial_shape: [500, 500, 1000]
+
+############ non-default args
+forest_path: 'D:/LLR DATA/20250407_LLR_L2/forest/20250407_LLR_L2_normalized.las'
+pretrain: 'data/model_weights/model_weights_20241213.pth'
+fp16: True
+tile_generation: True
+
+dataloader:
+  batch_size: 1
+  num_workers: 2
+
+shape_cfg:
+  outer_remove: ~
+  alpha: 0.6
+  buffer_size_to_determine_edge_trees: 0.3
+
+save_cfg:
+  save_formats: ['laz']
+  save_treewise: True
+  save_pointwise: True
+  save_backbone_feats: False
+  return_type: 'original'
+  results_dir: 'results'

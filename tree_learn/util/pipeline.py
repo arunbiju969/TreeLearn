@@ -19,7 +19,7 @@ import hdbscan
 from tree_learn.util.data_preparation import voxelize, compute_features, load_data, SampleGenerator
 
 
-N_JOBS = 10 # number of threads/processes to use for several functions that have multiprocessing/multithreading enabled
+N_JOBS = min(os.cpu_count() or 16, 16) # number of threads/processes to use for functions that have multiprocessing/multithreading enabled
 
 
 
@@ -46,7 +46,7 @@ def generate_tiles(cfg, forest_path, logger, return_type='voxelized'):
         data, original_idx = voxelize(data, cfg.voxel_size)
         data = data.astype(np.float32)
         data = np.round(data, 2)
-        np.savez_compressed(save_path_voxelized, points=data[:, :3], labels=data[:, 3])
+        np.savez(save_path_voxelized, points=data[:, :3], labels=data[:, 3])
 
         if return_type == 'original':
             original_idx = [list(item) for item in original_idx]
@@ -65,7 +65,7 @@ def generate_tiles(cfg, forest_path, logger, return_type='voxelized'):
     if not osp.exists(save_path_features):
         data = load_data(save_path_voxelized)
         features = compute_features(points=data[:, :3].astype(np.float64), search_radius=cfg.search_radius_features, feature_names=['verticality'], num_threads=N_JOBS)
-        np.savez_compressed(save_path_features, features=features)
+        np.savez(save_path_features, features=features)
         
     # add cfg args that were generated dynamically based on plot
     logger.info('getting tiles...')
@@ -222,7 +222,7 @@ def group_dbscan(cluster_coords, radius, npoint_thr, not_assigned_label_in_group
 
 # HDBSCAN
 def group_hdbscan(cluster_coords, npoint_thr, not_assigned_label_in_grouping, start_num_preds):
-    clustering = hdbscan.HDBSCAN(min_cluster_size=npoint_thr, core_dist_n_jobs=4).fit(cluster_coords)
+    clustering = hdbscan.HDBSCAN(min_cluster_size=npoint_thr, core_dist_n_jobs=N_JOBS).fit(cluster_coords)
     cluster_nums, n_points = np.unique(clustering.labels_, return_counts=True)
     valid_cluster_nums = cluster_nums[(n_points >= npoint_thr) & (cluster_nums != -1)]
     ind_valid = np.isin(clustering.labels_, valid_cluster_nums)
@@ -407,12 +407,11 @@ def save_data(data, save_format, save_name, save_folder, use_offset=True):
         las.treeID = labels
         las.classification = classification
 
-        # Generate a color for each unique label
-        unique_labels = np.unique(labels)
+        # Generate a color for each unique label (vectorized)
+        unique_labels, inverse_indices = np.unique(labels, return_inverse=True)
         color_map = {label: generate_random_color() for label in unique_labels}
-
-        # Assign colors based on label
-        colors = np.array([color_map[label] for label in labels], dtype=np.uint16)
+        palette = np.array([color_map[label] for label in unique_labels], dtype=np.uint16)
+        colors = palette[inverse_indices]
         colors[classification == 2] = [0, 0, 0]
 
         # Set RGB colors in the LAS file
@@ -444,26 +443,36 @@ def save_treewise(coords, instance_preds, cluster_means_within_hull, insts_not_a
     os.makedirs(trunk_base_inside_dir, exist_ok=True)
     os.makedirs(trunk_base_outside_dir, exist_ok=True)
 
-    unique_instances = np.unique(instance_preds)
+    # Vectorized grouping of coordinates by instance label (avoids thousands of 71M array scans)
+    order = np.argsort(instance_preds)
+    sorted_preds = instance_preds[order]
+    sorted_coords = coords[order]
+    unique_instances, split_indices = np.unique(sorted_preds, return_index=True)
+    slices = np.split(sorted_coords, split_indices[1:])
 
-    def _save_tree(i):
-        pred_coord = coords[instance_preds == i]
+    def _save_tree_item(item):
+        i, pred_coord = item
         pred_coord = np.hstack([pred_coord, i * np.ones(len(pred_coord))[:, None]])
         if i == non_trees_label_in_grouping:
-            # use offset=false here for easy visualization of all individual trees in cloudcompare
             save_data(pred_coord, save_format, 'non_trees', plot_results_dir, use_offset=False)
             return
 
-        if cluster_means_within_hull[i-1] and insts_not_at_edge[i-1]:
-            save_data(pred_coord, save_format, str(int(i)), completely_inside_dir, use_offset=False)
-        elif cluster_means_within_hull[i-1] and not insts_not_at_edge[i-1]:
-            save_data(pred_coord, save_format, str(int(i)), trunk_base_inside_dir, use_offset=False)
-        elif not cluster_means_within_hull[i-1]:
+        idx = int(i) - 1
+        if 0 <= idx < len(cluster_means_within_hull):
+            inside = cluster_means_within_hull[idx]
+            not_edge = insts_not_at_edge[idx] if idx < len(insts_not_at_edge) else False
+            if inside and not_edge:
+                save_data(pred_coord, save_format, str(int(i)), completely_inside_dir, use_offset=False)
+            elif inside and not not_edge:
+                save_data(pred_coord, save_format, str(int(i)), trunk_base_inside_dir, use_offset=False)
+            else:
+                save_data(pred_coord, save_format, str(int(i)), trunk_base_outside_dir, use_offset=False)
+        else:
             save_data(pred_coord, save_format, str(int(i)), trunk_base_outside_dir, use_offset=False)
 
-    max_workers = min(8, os.cpu_count() or 4)
+    max_workers = min(16, os.cpu_count() or 4)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        list(executor.map(_save_tree, unique_instances))
+        list(executor.map(_save_tree_item, zip(unique_instances, slices)))
 
 
 # get hash values of voxelized points
